@@ -26,9 +26,16 @@
 #define I915_REQUEST_H
 
 #include <linux/dma-fence.h>
+#include <linux/lockdep.h>
+
+#include "gem/i915_gem_context_types.h"
+#include "gt/intel_context_types.h"
+#include "gt/intel_engine_types.h"
+#include "gt/intel_timeline_types.h"
 
 #include "i915_gem.h"
 #include "i915_scheduler.h"
+#include "i915_selftest.h"
 #include "i915_sw_fence.h"
 
 #include <uapi/drm/i915_drm.h>
@@ -36,12 +43,18 @@
 struct drm_file;
 struct drm_i915_gem_object;
 struct i915_request;
-struct i915_timeline;
 
 struct i915_capture_list {
 	struct i915_capture_list *next;
 	struct i915_vma *vma;
 };
+
+#define RQ_TRACE(rq, fmt, ...) do {					\
+	const struct i915_request *rq__ = (rq);				\
+	ENGINE_TRACE(rq__->engine, "fence %llx:%lld, current %d " fmt,	\
+		     rq__->fence.context, rq__->fence.seqno,		\
+		     hwsp_seqno(rq__), ##__VA_ARGS__);			\
+} while (0)
 
 enum {
 	/*
@@ -64,6 +77,38 @@ enum {
 	 * a request is on the various signal_list.
 	 */
 	I915_FENCE_FLAG_SIGNAL,
+
+	/*
+	 * I915_FENCE_FLAG_NOPREEMPT - this request should not be preempted
+	 *
+	 * The execution of some requests should not be interrupted. This is
+	 * a sensitive operation as it makes the request super important,
+	 * blocking other higher priority work. Abuse of this flag will
+	 * lead to quality of service issues.
+	 */
+	I915_FENCE_FLAG_NOPREEMPT,
+
+	/*
+	 * I915_FENCE_FLAG_SENTINEL - this request should be last in the queue
+	 *
+	 * A high priority sentinel request may be submitted to clear the
+	 * submission queue. As it will be the only request in-flight, upon
+	 * execution all other active requests will have been preempted and
+	 * unsubmitted. This preemptive pulse is used to re-evaluate the
+	 * in-flight requests, particularly in cases where an active context
+	 * is banned and those active requests need to be cancelled.
+	 */
+	I915_FENCE_FLAG_SENTINEL,
+
+	/*
+	 * I915_FENCE_FLAG_BOOST - upclock the gpu for this request
+	 *
+	 * Some requests are more important than others! In particular, a
+	 * request that the user is waiting on is typically required for
+	 * interactive latency, for which we want to minimise by upclocking
+	 * the GPU. Here we track such boost requests on a per-request basis.
+	 */
+	I915_FENCE_FLAG_BOOST,
 };
 
 /**
@@ -103,11 +148,10 @@ struct i915_request {
 	 * i915_request_free() will then decrement the refcount on the
 	 * context.
 	 */
-	struct i915_gem_context *gem_context;
 	struct intel_engine_cs *engine;
-	struct intel_context *hw_context;
+	struct intel_context *context;
 	struct intel_ring *ring;
-	struct i915_timeline *timeline;
+	struct intel_timeline __rcu *timeline;
 	struct list_head signal_link;
 
 	/*
@@ -119,6 +163,15 @@ struct i915_request {
 	unsigned long rcustate;
 
 	/*
+	 * We pin the timeline->mutex while constructing the request to
+	 * ensure that no caller accidentally drops it during construction.
+	 * The timeline->mutex must be held to ensure that only this caller
+	 * can use the ring and manipulate the associated timeline during
+	 * construction.
+	 */
+	struct pin_cookie cookie;
+
+	/*
 	 * Fences for the various phases in the request's lifetime.
 	 *
 	 * The submit fence is used to await upon all of the request's
@@ -126,7 +179,16 @@ struct i915_request {
 	 * It is used by the driver to then queue the request for execution.
 	 */
 	struct i915_sw_fence submit;
-	wait_queue_entry_t submitq;
+	union {
+		wait_queue_entry_t submitq;
+		struct i915_sw_dma_fence_cb dmaq;
+		struct i915_request_duration_cb {
+			struct dma_fence_cb cb;
+			ktime_t emitted;
+		} duration;
+	};
+	struct list_head execute_cb;
+	struct i915_sw_fence semaphore;
 
 	/*
 	 * A list of everyone we wait upon, and everyone who waits upon us.
@@ -139,6 +201,7 @@ struct i915_request {
 	 */
 	struct i915_sched_node sched;
 	struct i915_dependency dep;
+	intel_engine_mask_t execution_mask;
 
 	/*
 	 * A convenience pointer to the current breadcrumb value stored in
@@ -147,13 +210,15 @@ struct i915_request {
 	 */
 	const u32 *hwsp_seqno;
 
-	/**
-	 * GEM sequence number associated with this request on the
-	 * global execution timeline. It is zero when the request is not
-	 * on the HW queue (i.e. not on the engine timeline list).
-	 * Its value is guarded by the timeline spinlock.
+	/*
+	 * If we need to access the timeline's seqno for this request in
+	 * another request, we need to keep a read reference to this associated
+	 * cacheline, so that we do not free and recycle it before the foreign
+	 * observers have completed. Hence, we keep a pointer to the cacheline
+	 * inside the timeline's HWSP vma, but it is only valid while this
+	 * request has not completed and guarded by the timeline mutex.
 	 */
-	u32 global_seqno;
+	struct intel_timeline_cacheline __rcu *hwsp_cacheline;
 
 	/** Position in the ring of the start of the request */
 	u32 head;
@@ -188,22 +253,21 @@ struct i915_request {
 	 * on the active_list (of their final request).
 	 */
 	struct i915_capture_list *capture_list;
-	struct list_head active_list;
 
 	/** Time at which this request was emitted, in jiffies. */
 	unsigned long emitted_jiffies;
 
-	bool waitboost;
-
-	/** engine->request_list entry for this request */
+	/** timeline->request entry for this request */
 	struct list_head link;
-
-	/** ring->request_list entry for this request */
-	struct list_head ring_link;
 
 	struct drm_i915_file_private *file_priv;
 	/** file_priv list entry for this request */
 	struct list_head client_link;
+
+	I915_SELFTEST_DECLARE(struct {
+		struct list_head link;
+		unsigned long delay;
+	} mock;)
 };
 
 #define I915_FENCE_GFP (GFP_KERNEL | __GFP_RETRY_MAYFAIL | __GFP_NOWARN)
@@ -216,8 +280,15 @@ static inline bool dma_fence_is_i915(const struct dma_fence *fence)
 }
 
 struct i915_request * __must_check
-i915_request_alloc(struct intel_engine_cs *engine,
-		   struct i915_gem_context *ctx);
+__i915_request_create(struct intel_context *ce, gfp_t gfp);
+struct i915_request * __must_check
+i915_request_create(struct intel_context *ce);
+
+struct i915_request *__i915_request_commit(struct i915_request *request);
+void __i915_request_queue(struct i915_request *rq,
+			  const struct i915_sched_attr *attr);
+
+bool i915_request_retire(struct i915_request *rq);
 void i915_request_retire_upto(struct i915_request *rq);
 
 static inline struct i915_request *
@@ -247,39 +318,19 @@ i915_request_put(struct i915_request *rq)
 	dma_fence_put(&rq->fence);
 }
 
-/**
- * i915_request_global_seqno - report the current global seqno
- * @request - the request
- *
- * A request is assigned a global seqno only when it is on the hardware
- * execution queue. The global seqno can be used to maintain a list of
- * requests on the same engine in retirement order, for example for
- * constructing a priority queue for waiting. Prior to its execution, or
- * if it is subsequently removed in the event of preemption, its global
- * seqno is zero. As both insertion and removal from the execution queue
- * may operate in IRQ context, it is not guarded by the usual struct_mutex
- * BKL. Instead those relying on the global seqno must be prepared for its
- * value to change between reads. Only when the request is complete can
- * the global seqno be stable (due to the memory barriers on submitting
- * the commands to the hardware to write the breadcrumb, if the HWS shows
- * that it has passed the global seqno and the global seqno is unchanged
- * after the read, it is indeed complete).
- */
-static inline u32
-i915_request_global_seqno(const struct i915_request *request)
-{
-	return READ_ONCE(request->global_seqno);
-}
-
 int i915_request_await_object(struct i915_request *to,
 			      struct drm_i915_gem_object *obj,
 			      bool write);
 int i915_request_await_dma_fence(struct i915_request *rq,
 				 struct dma_fence *fence);
+int i915_request_await_execution(struct i915_request *rq,
+				 struct dma_fence *fence,
+				 void (*hook)(struct i915_request *rq,
+					      struct dma_fence *signal));
 
 void i915_request_add(struct i915_request *rq);
 
-void __i915_request_submit(struct i915_request *request);
+bool __i915_request_submit(struct i915_request *request);
 void i915_request_submit(struct i915_request *request);
 
 void i915_request_skip(struct i915_request *request, int error);
@@ -296,10 +347,8 @@ long i915_request_wait(struct i915_request *rq,
 		       long timeout)
 	__attribute__((nonnull(1)));
 #define I915_WAIT_INTERRUPTIBLE	BIT(0)
-#define I915_WAIT_LOCKED	BIT(1) /* struct_mutex held, handle GPU reset */
-#define I915_WAIT_PRIORITY	BIT(2) /* small priority bump for the request */
-#define I915_WAIT_ALL		BIT(3) /* used by i915_gem_object_wait() */
-#define I915_WAIT_FOR_IDLE_BOOST BIT(4)
+#define I915_WAIT_PRIORITY	BIT(1) /* small priority bump for the request */
+#define I915_WAIT_ALL		BIT(2) /* used by i915_gem_object_wait() */
 
 static inline bool i915_request_signaled(const struct i915_request *rq)
 {
@@ -358,10 +407,27 @@ static inline bool __i915_request_has_started(const struct i915_request *rq)
  * i915_request_started - check if the request has begun being executed
  * @rq: the request
  *
- * Returns true if the request has been submitted to hardware, and the hardware
- * has advanced passed the end of the previous request and so should be either
- * currently processing the request (though it may be preempted and so
- * not necessarily the next request to complete) or have completed the request.
+ * If the timeline is not using initial breadcrumbs, a request is
+ * considered started if the previous request on its timeline (i.e.
+ * context) has been signaled.
+ *
+ * If the timeline is using semaphores, it will also be emitting an
+ * "initial breadcrumb" after the semaphores are complete and just before
+ * it began executing the user payload. A request can therefore be active
+ * on the HW and not yet started as it is still busywaiting on its
+ * dependencies (via HW semaphores).
+ *
+ * If the request has started, its dependencies will have been signaled
+ * (either by fences or by semaphores) and it will have begun processing
+ * the user payload.
+ *
+ * However, even if a request has started, it may have been preempted and
+ * so no longer active, or it may have already completed.
+ *
+ * See also i915_request_is_active().
+ *
+ * Returns true if the request has begun executing the user payload, or
+ * has completed:
  */
 static inline bool i915_request_started(const struct i915_request *rq)
 {
@@ -401,6 +467,47 @@ static inline void i915_request_mark_complete(struct i915_request *rq)
 	rq->hwsp_seqno = (u32 *)&rq->fence.seqno; /* decouple from HWSP */
 }
 
-void i915_retire_requests(struct drm_i915_private *i915);
+static inline bool i915_request_has_waitboost(const struct i915_request *rq)
+{
+	return test_bit(I915_FENCE_FLAG_BOOST, &rq->fence.flags);
+}
+
+static inline bool i915_request_has_nopreempt(const struct i915_request *rq)
+{
+	/* Preemption should only be disabled very rarely */
+	return unlikely(test_bit(I915_FENCE_FLAG_NOPREEMPT, &rq->fence.flags));
+}
+
+static inline bool i915_request_has_sentinel(const struct i915_request *rq)
+{
+	return unlikely(test_bit(I915_FENCE_FLAG_SENTINEL, &rq->fence.flags));
+}
+
+static inline struct intel_timeline *
+i915_request_timeline(struct i915_request *rq)
+{
+	/* Valid only while the request is being constructed (or retired). */
+	return rcu_dereference_protected(rq->timeline,
+					 lockdep_is_held(&rcu_access_pointer(rq->timeline)->mutex));
+}
+
+static inline struct i915_gem_context *
+i915_request_gem_context(struct i915_request *rq)
+{
+	/* Valid only while the request is being constructed (or retired). */
+	return rcu_dereference_protected(rq->context->gem_context, true);
+}
+
+static inline struct intel_timeline *
+i915_request_active_timeline(struct i915_request *rq)
+{
+	/*
+	 * When in use during submission, we are protected by a guarantee that
+	 * the context/timeline is pinned and must remain pinned until after
+	 * this submission.
+	 */
+	return rcu_dereference_protected(rq->timeline,
+					 lockdep_is_held(&rq->engine->active.lock));
+}
 
 #endif /* I915_REQUEST_H */

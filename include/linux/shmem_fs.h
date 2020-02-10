@@ -8,6 +8,7 @@
 #include <linux/pagemap.h>
 #include <linux/percpu_counter.h>
 #include <linux/xattr.h>
+#include <linux/fs_parser.h>
 
 /* inode in-kernel data */
 
@@ -21,6 +22,7 @@ struct shmem_inode_info {
 	struct list_head	swaplist;	/* chain of maybes on swap */
 	struct shared_policy	policy;		/* NUMA memory alloc policy */
 	struct simple_xattrs	xattrs;		/* list of xattrs */
+	atomic_t		stop_eviction;	/* hold when working on inode */
 	struct inode		vfs_inode;
 };
 
@@ -48,8 +50,9 @@ static inline struct shmem_inode_info *SHMEM_I(struct inode *inode)
 /*
  * Functions in mm/shmem.c called directly from elsewhere:
  */
+extern const struct fs_parameter_spec shmem_fs_parameters[];
 extern int shmem_init(void);
-extern int shmem_fill_super(struct super_block *sb, void *data, int silent);
+extern int shmem_init_fs_context(struct fs_context *fc);
 extern struct file *shmem_file_setup(const char *name,
 					loff_t size, unsigned long flags);
 extern struct file *shmem_kernel_file_setup(const char *name, loff_t size,

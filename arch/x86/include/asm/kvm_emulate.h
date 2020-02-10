@@ -222,12 +222,18 @@ struct x86_emulate_ops {
 
 	bool (*get_cpuid)(struct x86_emulate_ctxt *ctxt, u32 *eax, u32 *ebx,
 			  u32 *ecx, u32 *edx, bool check_limit);
+	bool (*guest_has_long_mode)(struct x86_emulate_ctxt *ctxt);
+	bool (*guest_has_movbe)(struct x86_emulate_ctxt *ctxt);
+	bool (*guest_has_fxsr)(struct x86_emulate_ctxt *ctxt);
+
 	void (*set_nmi_mask)(struct x86_emulate_ctxt *ctxt, bool masked);
 
 	unsigned (*get_hflags)(struct x86_emulate_ctxt *ctxt);
 	void (*set_hflags)(struct x86_emulate_ctxt *ctxt, unsigned hflags);
-	int (*pre_leave_smm)(struct x86_emulate_ctxt *ctxt, u64 smbase);
-
+	int (*pre_leave_smm)(struct x86_emulate_ctxt *ctxt,
+			     const char *smstate);
+	void (*post_leave_smm)(struct x86_emulate_ctxt *ctxt);
+	int (*set_xcr)(struct x86_emulate_ctxt *ctxt, u32 index, u64 xcr);
 };
 
 typedef u32 __attribute__((vector_size(16))) sse128_t;
@@ -427,6 +433,7 @@ enum x86_intercept {
 	x86_intercept_ins,
 	x86_intercept_out,
 	x86_intercept_outs,
+	x86_intercept_xsetbv,
 
 	nr_x86_intercepts
 };
