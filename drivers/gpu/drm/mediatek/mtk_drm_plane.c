@@ -80,6 +80,7 @@ static int mtk_plane_atomic_async_check(struct drm_plane *plane,
 					struct drm_plane_state *state)
 {
 	struct drm_crtc_state *crtc_state;
+	int ret;
 
 	if (plane != state->crtc->cursor)
 		return -EINVAL;
@@ -89,6 +90,11 @@ static int mtk_plane_atomic_async_check(struct drm_plane *plane,
 
 	if (!plane->state->fb)
 		return -EINVAL;
+
+	ret = mtk_drm_crtc_plane_check(state->crtc, plane,
+				       to_mtk_plane_state(state));
+	if (ret)
+		return ret;
 
 	if (state->state)
 		crtc_state = drm_atomic_get_existing_crtc_state(state->state,
@@ -115,6 +121,7 @@ static void mtk_plane_atomic_async_update(struct drm_plane *plane,
 	plane->state->src_y = new_state->src_y;
 	plane->state->src_h = new_state->src_h;
 	plane->state->src_w = new_state->src_w;
+	swap(plane->state->fb, new_state->fb);
 	state->pending.async_dirty = true;
 
 	mtk_drm_crtc_async_update(new_state->crtc, plane, new_state);
@@ -157,6 +164,16 @@ static int mtk_plane_atomic_check(struct drm_plane *plane,
 						   true, true);
 }
 
+static void mtk_plane_atomic_disable(struct drm_plane *plane,
+				     struct drm_plane_state *old_state)
+{
+	struct mtk_plane_state *state = to_mtk_plane_state(plane->state);
+
+	state->pending.enable = false;
+	wmb(); /* Make sure the above parameter is set before update */
+	state->pending.dirty = true;
+}
+
 static void mtk_plane_atomic_update(struct drm_plane *plane,
 				    struct drm_plane_state *old_state)
 {
@@ -170,6 +187,11 @@ static void mtk_plane_atomic_update(struct drm_plane *plane,
 
 	if (!crtc || WARN_ON(!fb))
 		return;
+
+	if (!plane->state->visible) {
+		mtk_plane_atomic_disable(plane, old_state);
+		return;
+	}
 
 	gem = fb->obj[0];
 	mtk_gem = to_mtk_gem_obj(gem);
@@ -190,16 +212,6 @@ static void mtk_plane_atomic_update(struct drm_plane *plane,
 	state->pending.height = drm_rect_height(&plane->state->dst);
 	state->pending.rotation = plane->state->rotation;
 	wmb(); /* Make sure the above parameters are set before update */
-	state->pending.dirty = true;
-}
-
-static void mtk_plane_atomic_disable(struct drm_plane *plane,
-				     struct drm_plane_state *old_state)
-{
-	struct mtk_plane_state *state = to_mtk_plane_state(plane->state);
-
-	state->pending.enable = false;
-	wmb(); /* Make sure the above parameter is set before update */
 	state->pending.dirty = true;
 }
 

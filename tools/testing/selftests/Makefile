@@ -6,6 +6,7 @@ TARGETS += breakpoints
 TARGETS += capabilities
 TARGETS += cgroup
 TARGETS += clone3
+TARGETS += core
 TARGETS += cpufreq
 TARGETS += cpu-hotplug
 TARGETS += drivers/dma-buf
@@ -15,6 +16,7 @@ TARGETS += filesystems
 TARGETS += filesystems/binderfs
 TARGETS += filesystems/epoll
 TARGETS += firmware
+TARGETS += fpu
 TARGETS += ftrace
 TARGETS += futex
 TARGETS += gpio
@@ -30,14 +32,16 @@ TARGETS += lkdtm
 TARGETS += membarrier
 TARGETS += memfd
 TARGETS += memory-hotplug
+TARGETS += mincore
 TARGETS += mount
 TARGETS += mqueue
 TARGETS += net
+TARGETS += net/forwarding
 TARGETS += net/mptcp
 TARGETS += netfilter
-TARGETS += networking/timestamping
 TARGETS += nsfs
 TARGETS += pidfd
+TARGETS += pid_namespace
 TARGETS += powerpc
 TARGETS += proc
 TARGETS += pstore
@@ -53,6 +57,7 @@ TARGETS += splice
 TARGETS += static_keys
 TARGETS += sync
 TARGETS += sysctl
+TARGETS += tc-testing
 TARGETS += timens
 ifneq (1, $(quicktest))
 TARGETS += timers
@@ -77,6 +82,12 @@ ifneq ($(SKIP_TARGETS),)
 	override TARGETS := $(TMP)
 endif
 
+# User can set FORCE_TARGETS to 1 to require all targets to be successfully
+# built; make will fail if any of the targets cannot be built. If
+# FORCE_TARGETS is not set (the default), make will succeed if at least one
+# of the targets gets built.
+FORCE_TARGETS ?=
+
 # Clear LDFLAGS and MAKEFLAGS if called from main
 # Makefile to avoid test build failures when test
 # Makefile doesn't have explicit build rules.
@@ -85,7 +96,7 @@ override LDFLAGS =
 override MAKEFLAGS =
 endif
 
-# Append kselftest to KBUILD_OUTPUT to avoid cluttering
+# Append kselftest to KBUILD_OUTPUT and O to avoid cluttering
 # KBUILD_OUTPUT with selftest objects and headers installed
 # by selftests Makefile or lib.mk.
 ifdef building_out_of_srctree
@@ -93,7 +104,7 @@ override LDFLAGS =
 endif
 
 ifneq ($(O),)
-	BUILD := $(O)
+	BUILD := $(O)/kselftest
 else
 	ifneq ($(KBUILD_OUTPUT),)
 		BUILD := $(KBUILD_OUTPUT)/kselftest
@@ -151,7 +162,8 @@ all: khdr
 	for TARGET in $(TARGETS); do				\
 		BUILD_TARGET=$$BUILD/$$TARGET;			\
 		mkdir $$BUILD_TARGET  -p;			\
-		$(MAKE) OUTPUT=$$BUILD_TARGET -C $$TARGET;	\
+		$(MAKE) OUTPUT=$$BUILD_TARGET -C $$TARGET	\
+				$(if $(FORCE_TARGETS),|| exit);	\
 		ret=$$((ret * $$?));				\
 	done; exit $$ret;
 
@@ -205,7 +217,8 @@ ifdef INSTALL_PATH
 	@ret=1;	\
 	for TARGET in $(TARGETS); do \
 		BUILD_TARGET=$$BUILD/$$TARGET;	\
-		$(MAKE) OUTPUT=$$BUILD_TARGET -C $$TARGET INSTALL_PATH=$(INSTALL_PATH)/$$TARGET install; \
+		$(MAKE) OUTPUT=$$BUILD_TARGET -C $$TARGET INSTALL_PATH=$(INSTALL_PATH)/$$TARGET install \
+				$(if $(FORCE_TARGETS),|| exit);	\
 		ret=$$((ret * $$?));		\
 	done; exit $$ret;
 
@@ -240,10 +253,17 @@ else
 	$(error Error: set INSTALL_PATH to use install)
 endif
 
+FORMAT ?= .gz
+TAR_PATH = $(abspath ${INSTALL_PATH}/kselftest-packages/kselftest.tar${FORMAT})
+gen_tar: install
+	@mkdir -p ${INSTALL_PATH}/kselftest-packages/
+	@tar caf ${TAR_PATH} --exclude=kselftest-packages -C ${INSTALL_PATH} .
+	@echo "Created ${TAR_PATH}"
+
 clean:
 	@for TARGET in $(TARGETS); do \
 		BUILD_TARGET=$$BUILD/$$TARGET;	\
 		$(MAKE) OUTPUT=$$BUILD_TARGET -C $$TARGET clean;\
 	done;
 
-.PHONY: khdr all run_tests hotplug run_hotplug clean_hotplug run_pstore_crash install clean
+.PHONY: khdr all run_tests hotplug run_hotplug clean_hotplug run_pstore_crash install clean gen_tar
